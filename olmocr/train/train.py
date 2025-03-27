@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 import torch.distributed
 import wandb
+import datasets  # Added for loading preprocessed datasets
 from datasets.utils import disable_progress_bars
 from datasets.utils.logging import set_verbosity
 from peft import LoraConfig, get_peft_model  # pyright: ignore
@@ -33,7 +34,7 @@ from .utils import (
     TruncatingCollator,
     get_local_dir,
     log_trainable_parameters,
-    make_dataset,
+    make_dataset,  # No longer used, as we load our processed data below.
     setup_environment,
 )
 
@@ -99,17 +100,22 @@ def run_train(config: TrainConfig):
     setup_environment(aws_config=config.aws, wandb_config=config.wandb, WANDB_RUN_GROUP=run_name.group)
 
     processor = AutoProcessor.from_pretrained(config.model.name_or_path, trust_remote_code=True)
-    #train_dataset, valid_dataset = make_dataset(config, processor)
+    # Load preprocessed datasets from disk (created by prepare_newseye_data.py)
+    logger.info("Loading preprocessed training dataset from disk...")
     train_dataset = datasets.load_from_disk("newseye_train_processed")
+    logger.info("Loading preprocessed validation dataset from disk...")
     valid_dataset = datasets.load_from_disk("newseye_val_processed")
+
     logger.info(train_dataset)
     logger.info(valid_dataset)
 
+    # Modified model loading: check for "qwen" or "olmocr"
     if "qwen" in config.model.name_or_path.lower() or "olmocr" in config.model.name_or_path.lower():
-         model = Qwen2VLForConditionalGeneration.from_pretrained(
-             config.model.name_or_path, torch_dtype=torch.bfloat16,
-             _attn_implementation="flash_attention_2" if config.model.use_flash_attn else None
-         )
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            config.model.name_or_path,
+            torch_dtype=torch.bfloat16,
+            _attn_implementation="flash_attention_2" if config.model.use_flash_attn else None
+        )
     else:
         from .molmo.config_molmo import MolmoConfig
         from .molmo.modeling_molmo import MolmoForCausalLM
@@ -125,7 +131,12 @@ def run_train(config: TrainConfig):
         if config.model.use_flash_attn:
             model_config.attention_type = "flash"
 
-        model = MolmoForCausalLM.from_pretrained(config.model.name_or_path, torch_dtype=torch.bfloat16, config=model_config, trust_remote_code=True)
+        model = MolmoForCausalLM.from_pretrained(
+            config.model.name_or_path,
+            torch_dtype=torch.bfloat16,
+            config=model_config,
+            trust_remote_code=True
+        )
 
     logger.info(model)
 
@@ -164,7 +175,7 @@ def run_train(config: TrainConfig):
             per_device_eval_batch_size=config.hparams.eval_batch_size or config.hparams.batch_size,
             gradient_checkpointing=config.hparams.gradient_checkpointing,
             gradient_checkpointing_kwargs=(
-                dict(use_reentrant=False)  # from this issue: https://github.com/huggingface/peft/issues/1142
+                dict(use_reentrant=False)
                 if config.hparams.gradient_checkpointing and config.lora is not None
                 else {}
             ),
@@ -179,7 +190,7 @@ def run_train(config: TrainConfig):
             warmup_steps=config.hparams.warmup_steps,
             warmup_ratio=config.hparams.warmup_ratio,
             bf16=True,
-            label_names=["labels"],  # fix from https://github.com/huggingface/transformers/issues/22885
+            label_names=["labels"],
             max_grad_norm=config.hparams.clip_grad_norm,
             remove_unused_columns=False,
             eval_on_start=True,
